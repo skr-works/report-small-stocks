@@ -1,8 +1,9 @@
 import re
 import sys
+import csv
 import datetime as dt
 from io import BytesIO
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 
 import requests
 import pdfplumber
@@ -10,7 +11,8 @@ from bs4 import BeautifulSoup
 
 
 FUND_PAGE_URL = "https://www.sbiokasan-am.co.jp/fund/552375/"
-UA = "MonthlyFundReportBot/0.2 (personal test; github-actions)"
+UA = "MonthlyFundReportBot/0.3 (personal test; github-actions)"
+MASTER_CSV_PATH = "data/master.csv"
 
 
 def http_get(url: str, timeout: int = 30) -> requests.Response:
@@ -21,7 +23,6 @@ def http_get(url: str, timeout: int = 30) -> requests.Response:
 
 def parse_jp_date(text: str) -> Optional[dt.date]:
     text = text.strip()
-
     m = re.search(r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日", text)
     if m:
         y, mo, d = map(int, m.groups())
@@ -33,7 +34,6 @@ def parse_jp_date(text: str) -> Optional[dt.date]:
         if mo == 12:
             return dt.date(y, 12, 31)
         return dt.date(y, mo + 1, 1) - dt.timedelta(days=1)
-
     return None
 
 
@@ -75,15 +75,6 @@ def find_latest_monthly_pdf(page_html: str, base_url: str) -> Tuple[str, Optiona
 
 
 def extract_top10_holdings_names(pdf_bytes: bytes) -> List[str]:
-    """
-    想定レイアウト（今回のPDF）:
-      1行に「業種 上位」＋「銘柄 上位」が同居し、行末に
-        "... 1 キッツ 5.6%"
-      のように銘柄側が来る。
-    方針:
-      「組入上位10銘柄」以降の行を走査し、各行で見つかる
-      (順位, 名称, 比率%) のマッチのうち "最後のマッチ" を銘柄として採用。
-    """
     text_all = []
     with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
@@ -94,14 +85,9 @@ def extract_top10_holdings_names(pdf_bytes: bytes) -> List[str]:
     full_text = "\n".join(text_all)
     lines = [ln.strip() for ln in full_text.splitlines() if ln.strip()]
 
-    print("=== PDF text sample (first 60 lines) ===")
-    for ln in lines[:60]:
-        print(ln)
-
     holdings: List[str] = []
     in_block = False
 
-    # 1〜10位の「順位 銘柄名 比率%」を拾う（複数マッチする行があるので最後を採用）
     pat = re.compile(r"(\d{1,2})\s+([^\d%]+?)\s+(\d+(?:\.\d+)?)%")
 
     for ln in lines:
@@ -111,7 +97,6 @@ def extract_top10_holdings_names(pdf_bytes: bytes) -> List[str]:
         if not in_block:
             continue
 
-        # セクション終端の目安（必要なら増やす）
         if ("当レポートは" in ln) or ("(1/8)" in ln) or ("ご注意" in ln):
             break
 
@@ -119,29 +104,101 @@ def extract_top10_holdings_names(pdf_bytes: bytes) -> List[str]:
         if not matches:
             continue
 
-        # その行に複数ある場合、最後が銘柄側であることが多いので最後を採用
         m = matches[-1]
         rank = int(m.group(1))
         name = m.group(2).strip()
 
-        # 1〜10位だけ
-        if 1 <= rank <= 10:
-            # 順位が飛ぶ/重複する可能性もあるので、重複排除しつつ追加
-            if name not in holdings:
-                holdings.append(name)
-
+        if 1 <= rank <= 10 and name not in holdings:
+            holdings.append(name)
         if len(holdings) >= 10:
             break
 
-    if not holdings:
-        print("WARN: No holdings extracted. Dumping context around '組入上位10銘柄' (if any).")
-        idxs = [i for i, ln in enumerate(lines) if "組入上位10銘柄" in ln]
-        for idx in idxs[:2]:
-            print("=== Context around '組入上位10銘柄' ===")
-            for j in range(max(0, idx - 10), min(len(lines), idx + 40)):
-                print(lines[j])
-
     return holdings[:10]
+
+
+def normalize_name(s: str) -> str:
+    """
+    簡易正規化：社名表記ゆれを潰す（完全一致精度を上げる）
+    """
+    s = s.strip()
+    s = s.replace("　", " ").replace("\u3000", " ")
+    s = re.sub(r"\s+", "", s)
+
+    # 会社種別の揺れ
+    s = s.replace("株式会社", "").replace("(株)", "").replace("（株）", "")
+    s = s.replace("有限会社", "").replace("合同会社", "")
+
+    # 括弧の揺れ
+    s = s.replace("（", "(").replace("）", ")")
+
+    return s
+
+
+def load_master_csv(path: str) -> List[Tuple[str, str]]:
+    """
+    CSV: code,name
+    """
+    rows: List[Tuple[str, str]] = []
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        if "code" not in reader.fieldnames or "name" not in reader.fieldnames:
+            raise RuntimeError(f"master.csv must have headers: code,name (got {reader.fieldnames})")
+        for r in reader:
+            code = (r.get("code") or "").strip()
+            name = (r.get("name") or "").strip()
+            code4 = re.sub(r"\D", "", code)[:4]
+            if len(code4) != 4 or not name:
+                continue
+            rows.append((code4, name))
+    return rows
+
+
+def build_indexes(master_rows: List[Tuple[str, str]]) -> Tuple[Dict[str, str], List[Tuple[str, str, str]]]:
+    """
+    1) 完全一致用 dict: normalized_name -> code
+    2) 部分一致用 list: (code, raw_name, normalized_name)
+    """
+    exact: Dict[str, str] = {}
+    partial: List[Tuple[str, str, str]] = []
+    for code, name in master_rows:
+        n = normalize_name(name)
+        if n:
+            exact[n] = code
+            partial.append((code, name, n))
+    return exact, partial
+
+
+def resolve_code(name: str, exact: Dict[str, str], partial: List[Tuple[str, str, str]]) -> Tuple[Optional[str], str]:
+    """
+    戻り: (code, status)
+      status:
+        EXACT / PARTIAL / NOT_FOUND / AMBIGUOUS
+    """
+    key = normalize_name(name)
+
+    # 1) 完全一致
+    if key in exact:
+        return exact[key], "EXACT"
+
+    # 2) 部分一致（安全策：候補が1件のみなら採用、複数はAMBIGUOUS）
+    hits = []
+    for code, raw, norm in partial:
+        # 双方向に見る（どっちが長いか不明なため）
+        if key and (key in norm or norm in key):
+            hits.append((code, raw))
+
+    # ノイズ対策：短すぎるキー（2文字以下）は部分一致しない
+    if len(key) <= 2:
+        return None, "NOT_FOUND"
+
+    if len(hits) == 1:
+        return hits[0][0], "PARTIAL"
+    if len(hits) >= 2:
+        # 候補をログに出せるよう、ここではAMBIGUOUS
+        print(f"AMBIGUOUS: '{name}' -> candidates={hits[:10]}")
+        return None, "AMBIGUOUS"
+
+    return None, "NOT_FOUND"
 
 
 def main() -> int:
@@ -156,13 +213,19 @@ def main() -> int:
     print(f"PDF_BYTES={len(pdf_bytes)} url={latest_pdf_url} report_date={latest_date}")
 
     holdings = extract_top10_holdings_names(pdf_bytes)
-
     print("=== Extracted holdings (names only) ===")
-    if holdings:
-        for i, n in enumerate(holdings, 1):
-            print(f"{i:02d}. {n}")
-    else:
-        print("(none)")
+    for i, n in enumerate(holdings, 1):
+        print(f"{i:02d}. {n}")
+
+    # master (repo内)
+    master_rows = load_master_csv(MASTER_CSV_PATH)
+    exact, partial = build_indexes(master_rows)
+    print(f"MASTER rows={len(master_rows)} exact_keys={len(exact)}")
+
+    print("=== Resolved (name -> code) ===")
+    for n in holdings:
+        code, status = resolve_code(n, exact, partial)
+        print(f"{n}\t{code if code else 'NONE'}\t{status}")
 
     return 0
 
