@@ -118,18 +118,40 @@ def extract_top10_holdings_names(pdf_bytes: bytes) -> List[str]:
 
 def normalize_name(s: str) -> str:
     """
-    簡易正規化：社名表記ゆれを潰す（完全一致精度を上げる）
+    社名表記ゆれを潰す（完全一致精度を上げる）
     """
     s = s.strip()
+
+    # 全角/半角スペース
     s = s.replace("　", " ").replace("\u3000", " ")
     s = re.sub(r"\s+", "", s)
 
-    # 会社種別の揺れ
+    # 会社種別
     s = s.replace("株式会社", "").replace("(株)", "").replace("（株）", "")
     s = s.replace("有限会社", "").replace("合同会社", "")
 
-    # 括弧の揺れ
+    # 括弧
     s = s.replace("（", "(").replace("）", ")")
+
+    # 大文字小文字（英字が混じる場合用）
+    s = s.upper()
+
+    # 全角英数字→半角（最低限）
+    trans = str.maketrans({
+        "Ａ": "A", "Ｂ": "B", "Ｃ": "C", "Ｄ": "D", "Ｅ": "E", "Ｆ": "F", "Ｇ": "G", "Ｈ": "H", "Ｉ": "I", "Ｊ": "J",
+        "Ｋ": "K", "Ｌ": "L", "Ｍ": "M", "Ｎ": "N", "Ｏ": "O", "Ｐ": "P", "Ｑ": "Q", "Ｒ": "R", "Ｓ": "S", "Ｔ": "T",
+        "Ｕ": "U", "Ｖ": "V", "Ｗ": "W", "Ｘ": "X", "Ｙ": "Y", "Ｚ": "Z",
+        "０": "0", "１": "1", "２": "2", "３": "3", "４": "4", "５": "5", "６": "6", "７": "7", "８": "8", "９": "9",
+    })
+    s = s.translate(trans)
+
+    # ホールディングス系の表記ゆれは同一視（削除）
+    s = s.replace("ホールディングス", "")
+    s = s.replace("HOLDINGS", "")
+    s = s.replace("HLDGS", "")
+    s = s.replace("HLDG", "")
+    s = re.sub(r"\bHD\b", "", s)
+    s = s.replace("HD", "")
 
     return s
 
@@ -183,7 +205,6 @@ def resolve_code(name: str, exact: Dict[str, str], partial: List[Tuple[str, str,
     # 2) 部分一致（安全策：候補が1件のみなら採用、複数はAMBIGUOUS）
     hits = []
     for code, raw, norm in partial:
-        # 双方向に見る（どっちが長いか不明なため）
         if key and (key in norm or norm in key):
             hits.append((code, raw))
 
@@ -194,7 +215,6 @@ def resolve_code(name: str, exact: Dict[str, str], partial: List[Tuple[str, str,
     if len(hits) == 1:
         return hits[0][0], "PARTIAL"
     if len(hits) >= 2:
-        # 候補をログに出せるよう、ここではAMBIGUOUS
         print(f"AMBIGUOUS: '{name}' -> candidates={hits[:10]}")
         return None, "AMBIGUOUS"
 
