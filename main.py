@@ -14,6 +14,16 @@ from bs4 import BeautifulSoup
 UA = "MonthlyFundReportBot/0.5 (github-actions test)"
 MASTER_CSV_PATH = "data/master.csv"
 
+# 東証33業種（PDFの「組入上位10業種」に出るやつを弾くため）
+TSE_33_SECTORS = {
+    "水産・農林業", "鉱業", "建設業", "食料品", "繊維製品", "パルプ・紙", "化学",
+    "医薬品", "石油・石炭製品", "ゴム製品", "ガラス・土石製品", "鉄鋼", "非鉄金属",
+    "金属製品", "機械", "電気機器", "輸送用機器", "精密機器", "その他製品",
+    "電気・ガス業", "陸運業", "海運業", "空運業", "倉庫・運輸関連業", "情報・通信業",
+    "卸売業", "小売業", "銀行業", "証券、商品先物取引業", "保険業",
+    "その他金融業", "不動産業", "サービス業"
+}
+
 # ファンド設定リスト
 TARGET_FUNDS = [
     {
@@ -108,9 +118,6 @@ def find_pdf_sparx_backtrack(url_template: str) -> Tuple[str, Optional[dt.date]]
     """スパークス用: 先月から遡って存在確認 (推測アタック)"""
     today = dt.date.today()
     
-    # 1ヶ月前から最大3ヶ月前までチェック (例: 今が2/1なら、1/1(12月分) -> 12/1(11月分)...)
-    # ※スパークスのファイル名は rsn_202501.pdf (2025年1月) の形式と仮定
-    
     for i in range(1, 4):
         target_month = today - relativedelta(months=i)
         ym_str = target_month.strftime("%Y%m")
@@ -143,191 +150,4 @@ def extract_top10_holdings(pdf_bytes: bytes, trigger: str, skip_keywords: List[s
     holdings: List[str] = []
     in_block = False
     
-    # Regex: 順位(1~2桁) + 空白 + 銘柄名(数字%以外) + 空白 + 比率(数字.数字%)
-    # ※スパークスで間に業種が入る場合、銘柄名の一部として吸われる可能性があるが、
-    #   後段の正規化(normalize)と部分一致で吸収を試みる。
-    pat = re.compile(r"(\d{1,2})\s+([^\d%]+?)\s+(\d+(?:\.\d+)?)%")
-
-    for ln in lines:
-        # トリガーチェック
-        if trigger in ln:
-            in_block = True
-            continue
-        
-        if not in_block:
-            continue
-            
-        # 除外キーワード
-        if any(sk in ln for sk in skip_keywords):
-            continue
-
-        # 終了判定（とりあえず10件取れたら終わり、または明らかに別のセクション）
-        # ※シンプル化のため、マッチしなくなったら終わるロジックは採用せず、10件とるまで続ける
-        
-        matches = list(pat.finditer(ln))
-        if not matches:
-            continue
-
-        # 1行に複数あるケースも考慮してループ (通常は1行1銘柄)
-        for m in matches:
-            rank = int(m.group(1))
-            name = m.group(2).strip()
-            
-            if 1 <= rank <= 10 and name not in holdings:
-                holdings.append(name)
-        
-        if len(holdings) >= 10:
-            break
-
-    return holdings[:10]
-
-
-# --- Master Data & Resolver ---
-
-def normalize_name(s: str) -> str:
-    s = s.strip()
-    s = s.replace("　", " ").replace("\u3000", " ")
-    s = re.sub(r"\s+", "", s)
-    s = s.replace("株式会社", "").replace("(株)", "").replace("（株）", "")
-    s = s.replace("（", "(").replace("）", ")")
-    s = s.upper()
-    
-    # Full-width alpha to half-width
-    trans = str.maketrans({
-        chr(0xFF21 + i): chr(0x41 + i) for i in range(26)
-    })
-    s = s.translate(trans)
-    trans_num = str.maketrans({
-        chr(0xFF10 + i): chr(0x30 + i) for i in range(10)
-    })
-    s = s.translate(trans_num)
-    
-    s = s.replace("ホールディングス", "").replace("HOLDINGS", "").replace("HLDGS", "")
-    s = re.sub(r"\bHD\b", "", s).replace("HD", "")
-    return s
-
-def load_master_csv(path: str) -> Tuple[Dict[str, str], List[Tuple[str, str, str]]]:
-    """
-    code, name, sector の3列があっても、code, name のみを使用する
-    """
-    exact = {}
-    partial = []
-    
-    try:
-        with open(path, "r", encoding="utf-8-sig", newline="") as f:
-            reader = csv.DictReader(f)
-            # 必須カラムチェック
-            if "code" not in reader.fieldnames or "name" not in reader.fieldnames:
-                print(f"[Warning] CSV headers missing code or name: {reader.fieldnames}")
-                return {}, []
-
-            for r in reader:
-                code = (r.get("code") or "").strip()
-                name = (r.get("name") or "").strip()
-                # sector は無視
-
-                code4 = re.sub(r"\D", "", code)[:4]
-                if len(code4) != 4 or not name:
-                    continue
-                
-                n = normalize_name(name)
-                if n:
-                    exact[n] = code4
-                    partial.append((code4, name, n))
-                    
-    except FileNotFoundError:
-        print(f"[Error] {path} not found.")
-        sys.exit(1)
-        
-    return exact, partial
-
-def resolve_code(name: str, exact: Dict[str, str], partial: List[Tuple[str, str, str]]) -> Tuple[Optional[str], str]:
-    key = normalize_name(name)
-    if key in exact:
-        return exact[key], "EXACT"
-
-    # 部分一致
-    hits = []
-    for code, raw, norm in partial:
-        if key and (key in norm or norm in key):
-            hits.append(code)
-    
-    if len(key) <= 2:
-        return None, "TOO_SHORT"
-    
-    if len(hits) == 1:
-        return hits[0], "PARTIAL"
-    if len(hits) >= 2:
-        return None, "AMBIGUOUS"
-    
-    return None, "NOT_FOUND"
-
-
-# --- Main ---
-
-def main():
-    print(f"=== Job Start: {dt.datetime.now()} ===")
-    
-    # Master Load
-    exact, partial = load_master_csv(MASTER_CSV_PATH)
-    print(f"Master loaded: {len(exact)} exact keys.")
-
-    results = []
-
-    for fund in TARGET_FUNDS:
-        fid = fund["id"]
-        print(f"\n--- Processing: {fid} ---")
-        
-        try:
-            # 1. Find PDF
-            pdf_url = ""
-            report_date = None
-            
-            if fund["finder_type"] == "sbi_scrape":
-                pdf_url, report_date = find_pdf_sbi(fund["url"])
-            elif fund["finder_type"] == "sparx_backtrack":
-                pdf_url, report_date = find_pdf_sparx_backtrack(fund["pdf_url_template"])
-            
-            print(f"  Target PDF: {pdf_url}")
-            print(f"  Report Date: {report_date}")
-
-            # 2. Download
-            pdf_resp = http_get(pdf_url)
-            pdf_bytes = pdf_resp.content
-
-            # 3. Extract Names
-            raw_names = extract_top10_holdings(
-                pdf_bytes, 
-                fund["extract_trigger"], 
-                fund["skip_keywords"]
-            )
-            
-            if not raw_names:
-                print("  [Warning] No holdings found.")
-                continue
-
-            # 4. Resolve Codes
-            print("  [Holdings]")
-            for name in raw_names:
-                code, status = resolve_code(name, exact, partial)
-                print(f"    - {name} -> {code} ({status})")
-                
-                results.append({
-                    "fund_id": fid,
-                    "report_date": str(report_date),
-                    "rank_name": name,
-                    "code": code,
-                    "status": status
-                })
-
-        except Exception as e:
-            print(f"  [Error] Failed to process {fid}: {e}")
-            import traceback
-            traceback.print_exc()
-
-    print("\n=== Job Finished ===")
-    # ここで results をファイルに出力するなどの処理が可能
-    # 今回は標準出力のみ
-
-if __name__ == "__main__":
-    main()
+    pat = re.compile(r"(\d{1,2})\s+([^\d%]+?)\s+
