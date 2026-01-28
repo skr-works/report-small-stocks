@@ -121,10 +121,6 @@ def find_pdf_sparx_backtrack(url_template: str) -> Tuple[str, Optional[dt.date]]
 # --- Extractor ---
 
 def extract_top10_holdings(pdf_bytes: bytes, trigger: str, skip_keywords: List[str]) -> List[str]:
-    """
-    SBI系PDFで extract_text() の行順が崩れても、
-    「組入上位10銘柄」セクションだけを切り出して rank=1..10 を取る。
-    """
     text_all = []
     with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
@@ -133,68 +129,46 @@ def extract_top10_holdings(pdf_bytes: bytes, trigger: str, skip_keywords: List[s
                 text_all.append(t)
 
     full_text = "\n".join(text_all)
-    if not full_text:
-        return []
+    lines = [ln.strip() for ln in full_text.splitlines() if ln.strip()]
 
-    pos = full_text.find(trigger)
-    if pos < 0:
-        return []
+    holdings: List[str] = []
+    in_block = False
 
-    # トリガー以降だけ切り出し（長めに）
-    block = full_text[pos:pos + 8000]
+    # Regex: 順位(1~2桁) + 空白 + 銘柄名(数字%以外) + 空白 + 比率(数字.数字%)
+    pat = re.compile(r"(\d{1,2})\s+([^\d%]+?)\s+(\d+(?:\.\d+)?)%")
 
-    # 次セクションで打ち切り（SBIの体裁に合わせて）
-    stop_markers = [
-        "ポートフォリオ構成比率",
-        "ポートフォリオ",
-        "組入銘柄数",
-        "国内株式市場別組入比率",
-        "当レポートは",
-    ]
-    cut = None
-    for sm in stop_markers:
-        p = block.find(sm)
-        if p >= 0:
-            cut = p if cut is None else min(cut, p)
-    if cut is not None:
-        block = block[:cut]
+    for ln in lines:
+        # トリガーチェック
+        if trigger in ln:
+            in_block = True
+            continue
 
-    # スキップ行を除去（ヘッダ等）
-    if skip_keywords:
-        filtered_lines = []
-        for ln in block.splitlines():
-            s = ln.strip()
-            if not s:
-                continue
-            if any(sk in s for sk in skip_keywords):
-                continue
-            filtered_lines.append(s)
-        block = "\n".join(filtered_lines)
+        if not in_block:
+            continue
 
-    # rank 1..10 を抽出（行頭基準）
-    pat_line = re.compile(r"(?m)^\s*(10|[1-9])\s+([^\d%\n]+?)\s+(\d+(?:\.\d+)?)%")
-    found: Dict[int, str] = {}
-    for m in pat_line.finditer(block):
-        rank = int(m.group(1))
-        name = m.group(2).strip()
-        if 1 <= rank <= 10 and name and rank not in found:
-            found[rank] = name
-        if len(found) >= 10:
-            break
+        # 除外キーワード
+        if any(sk in ln for sk in skip_keywords):
+            continue
 
-    # まだ足りない場合のフォールバック（行順がさらに崩れているケース）
-    if len(found) < 10:
-        pat_any = re.compile(r"(10|[1-9])\s+([^\d%]+?)\s+(\d+(?:\.\d+)?)%")
-        for m in pat_any.finditer(block):
+        matches = list(pat.finditer(ln))
+        if not matches:
+            continue
+
+        # SBIのPDFでは「業種」と「銘柄」が同一行に並ぶため、複数マッチ時は右側(最後)だけ採用
+        if len(matches) >= 2:
+            matches = [matches[-1]]
+
+        for m in matches:
             rank = int(m.group(1))
             name = m.group(2).strip()
-            if 1 <= rank <= 10 and name and rank not in found:
-                found[rank] = name
-            if len(found) >= 10:
-                break
 
-    # rank順に返す
-    return [found[r] for r in range(1, 11) if r in found][:10]
+            if 1 <= rank <= 10 and name not in holdings:
+                holdings.append(name)
+
+        if len(holdings) >= 10:
+            break
+
+    return holdings[:10]
 
 def _fw_to_hw_digits(s: str) -> str:
     trans = str.maketrans({chr(0xFF10 + i): chr(0x30 + i) for i in range(10)})
@@ -220,10 +194,7 @@ def extract_top10_holdings_sparx_table(pdf_bytes: bytes, trigger: str) -> List[s
 
     with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
-            page_text = page.extract_text() or ""
-            if trigger not in page_text:
-                continue
-
+            # trigger文字がPDF内で字形崩れすることがあるため、ここではトリガー必須にしない
             tbl = None
             try:
                 tbl = page.extract_table(table_settings)
@@ -239,7 +210,8 @@ def extract_top10_holdings_sparx_table(pdf_bytes: bytes, trigger: str) -> List[s
                 for t in tables:
                     # 1〜10がありそうなテーブルを選ぶ
                     flat = " ".join([" ".join([c or "" for c in row]) for row in (t or [])])
-                    if "1" in _fw_to_hw_digits(flat) and "10" in _fw_to_hw_digits(flat):
+                    flat_hw = _fw_to_hw_digits(flat)
+                    if re.search(r"\b1\b", flat_hw) and re.search(r"\b10\b", flat_hw):
                         tbl = t
                         break
 
