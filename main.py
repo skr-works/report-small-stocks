@@ -11,32 +11,43 @@ import pdfplumber
 from bs4 import BeautifulSoup
 
 # --- Configuration ---
-UA = "MonthlyFundReportBot/0.6 (fix extraction)"
+UA = "MonthlyFundReportBot/0.5 (github-actions test)"
 MASTER_CSV_PATH = "data/master.csv"
+
+# 東証33業種（PDFの「組入上位10業種」に出るやつを弾くため）
+TSE_33_SECTORS = {
+    "水産・農林業", "鉱業", "建設業", "食料品", "繊維製品", "パルプ・紙", "化学",
+    "医薬品", "石油・石炭製品", "ゴム製品", "ガラス・土石製品", "鉄鋼", "非鉄金属",
+    "金属製品", "機械", "電気機器", "輸送用機器", "精密機器", "その他製品",
+    "電気・ガス業", "陸運業", "海運業", "空運業", "倉庫・運輸関連業", "情報・通信業",
+    "卸売業", "小売業", "銀行業", "証券、商品先物取引業", "保険業",
+    "その他金融業", "不動産業", "サービス業"
+}
 
 # ファンド設定リスト
 TARGET_FUNDS = [
     {
-        "id": "SBI_SmallMonsters",
+        "id": "SBI_SmallMonsters",  # 旧: 552375 (スモール・モンスターズ・ジャパン)
         "url": "https://www.sbiokasan-am.co.jp/fund/552375/",
         "finder_type": "sbi_scrape",
-        "extract_trigger": "組入上位",  # "10銘柄"まで書くとスペース有無でコケるため短縮
-        "skip_keywords": ["当レポートは", "(1/8)", "ご注意", "※", "業種"],
+        "extract_trigger": "組入上位10銘柄",  # 部分一致
+        "skip_keywords": ["当レポートは", "(1/8)", "ご注意", "※"],
     },
     {
-        "id": "SBI_RoboPro",
+        "id": "SBI_RoboPro",  # 新規: ROBO PRO
         "url": "https://www.sbiokasan-am.co.jp/fund/553175/",
         "finder_type": "sbi_scrape",
-        "extract_trigger": "組入上位",
-        "skip_keywords": ["当レポートは", "(1/8)", "ご注意", "※", "業種"],
+        "extract_trigger": "組入上位10銘柄",
+        "skip_keywords": ["当レポートは", "(1/8)", "ご注意", "※"],
     },
     {
-        "id": "Sparx_Gensen",
-        "url": "https://www.sparx.co.jp/mutual/rsn.html",
+        "id": "Sparx_Gensen",  # 新規: スパークス・厳選投資
+        "url": "https://www.sparx.co.jp/mutual/rsn.html", # エラー時の参照用
         "finder_type": "sparx_backtrack",
+        # URLテンプレート: {ym} が YYYYMM (例: 202412) に置換される
         "pdf_url_template": "https://www.sparx.co.jp/mutual/rsn_{ym}.pdf",
-        "extract_trigger": "組入上位", # 【 】もスペースが入る可能性があるのでキーワードのみにする
-        "skip_keywords": ["銘柄総数", "コード", "銘柄名", "業種", "比率"],
+        "extract_trigger": "【組⼊上位10銘柄】", # 厳密一致
+        "skip_keywords": ["銘柄総数", "コード", "銘柄名", "業種", "比率"], # ヘッダや総数行をスキップ
     },
 ]
 
@@ -52,6 +63,7 @@ def http_get(url: str, timeout: int = 30) -> requests.Response:
         raise
 
 def http_head(url: str, timeout: int = 10) -> bool:
+    """ファイルの存在確認 (200 OKならTrue)"""
     try:
         r = requests.head(url, headers={"User-Agent": UA}, timeout=timeout)
         return r.status_code == 200
@@ -62,17 +74,21 @@ def http_head(url: str, timeout: int = 10) -> bool:
 
 def parse_jp_date(text: str) -> Optional[dt.date]:
     text = text.strip()
+    # 2024年1月31日
     m = re.search(r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日", text)
     if m:
         y, mo, d = map(int, m.groups())
         return dt.date(y, mo, d)
+    # 2024年1月末
     m = re.search(r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*末", text)
     if m:
         y, mo = map(int, m.groups())
+        # 末日は厳密でなくてもソートできれば良いが、一応計算
         return dt.date(y, mo, 1) + relativedelta(months=1, days=-1)
     return None
 
 def find_pdf_sbi(base_url: str) -> Tuple[str, Optional[dt.date]]:
+    """SBI岡三サイト用: HTMLからリンクを探索して最新日付を取得"""
     resp = http_get(base_url)
     soup = BeautifulSoup(resp.text, "lxml")
     
@@ -92,12 +108,16 @@ def find_pdf_sbi(base_url: str) -> Tuple[str, Optional[dt.date]]:
     if not candidates:
         raise RuntimeError("No monthly PDF candidates found.")
 
+    # 日付順にソート（日付がNoneのものは後ろへ）
     candidates.sort(key=lambda x: (x[0] is not None, x[0] or dt.date(1900, 1, 1)), reverse=True)
+    
     best_date, best_url, _ = candidates[0]
     return best_url, best_date
 
 def find_pdf_sparx_backtrack(url_template: str) -> Tuple[str, Optional[dt.date]]:
+    """スパークス用: 先月から遡って存在確認 (推測アタック)"""
     today = dt.date.today()
+    
     for i in range(1, 4):
         target_month = today - relativedelta(months=i)
         ym_str = target_month.strftime("%Y%m")
@@ -106,6 +126,7 @@ def find_pdf_sparx_backtrack(url_template: str) -> Tuple[str, Optional[dt.date]]
         print(f"  Checking: {url} ... ", end="")
         if http_head(url):
             print("FOUND")
+            # 基準日は「その月の末日」として仮定
             report_date = target_month + relativedelta(day=31)
             return url, report_date
         print("404")
@@ -129,21 +150,18 @@ def extract_top10_holdings(pdf_bytes: bytes, trigger: str, skip_keywords: List[s
     holdings: List[str] = []
     in_block = False
     
-    # 順位 + 銘柄名(空白含むかも) + 比率
-    # 注意: スパークス等は "順位 銘柄名 業種 比率" の可能性あり。
-    # 最後のキャプチャグループを比率とし、真ん中を全部取得してから後処理で銘柄名を特定する。
-    pat = re.compile(r"(\d{1,2})\s+(.+?)\s+(\d+(?:\.\d+)?)%")
+    pat = re.compile(r"(\d{1,2})\s+([^\d%]+?)\s+(\d+(?:\.\d+)?)%")
 
     for ln in lines:
-        # スペースを除去してトリガー判定（"組 入 上 位" 対策）
-        norm_ln = ln.replace(" ", "").replace("　", "")
-        if trigger in norm_ln:
+        # トリガーチェック
+        if trigger in ln:
             in_block = True
             continue
         
         if not in_block:
             continue
             
+        # 除外キーワード
         if any(sk in ln for sk in skip_keywords):
             continue
 
@@ -151,14 +169,23 @@ def extract_top10_holdings(pdf_bytes: bytes, trigger: str, skip_keywords: List[s
         if not matches:
             continue
 
-        for m in matches:
+        # 1行に「業種」と「銘柄」が並ぶことがあるため、基本は右側（最後）を優先
+        # ただし複数マッチがある場合は全マッチも見る（10件揃えるため）
+        iter_matches = matches if len(matches) == 1 else matches[::-1]  # 右から処理
+
+        for m in iter_matches:
             rank = int(m.group(1))
-            name_raw = m.group(2).strip() # ここに "銘柄名 業種" が入る可能性がある
+            name = m.group(2).strip()
+
+            # 「組入上位10業種」の業種名を誤抽出したものを除外
+            if name in TSE_33_SECTORS:
+                continue
             
-            if 1 <= rank <= 10:
-                # 既に登録済みでなければ追加
-                if name_raw not in holdings:
-                    holdings.append(name_raw)
+            if 1 <= rank <= 10 and name not in holdings:
+                holdings.append(name)
+
+            if len(holdings) >= 10:
+                break
         
         if len(holdings) >= 10:
             break
@@ -176,9 +203,14 @@ def normalize_name(s: str) -> str:
     s = s.replace("（", "(").replace("）", ")")
     s = s.upper()
     
-    trans = str.maketrans({chr(0xFF21 + i): chr(0x41 + i) for i in range(26)})
+    # Full-width alpha to half-width
+    trans = str.maketrans({
+        chr(0xFF21 + i): chr(0x41 + i) for i in range(26)
+    })
     s = s.translate(trans)
-    trans_num = str.maketrans({chr(0xFF10 + i): chr(0x30 + i) for i in range(10)})
+    trans_num = str.maketrans({
+        chr(0xFF10 + i): chr(0x30 + i) for i in range(10)
+    })
     s = s.translate(trans_num)
     
     s = s.replace("ホールディングス", "").replace("HOLDINGS", "").replace("HLDGS", "")
@@ -186,11 +218,16 @@ def normalize_name(s: str) -> str:
     return s
 
 def load_master_csv(path: str) -> Tuple[Dict[str, str], List[Tuple[str, str, str]]]:
+    """
+    code, name, sector の3列があっても、code, name のみを使用する
+    """
     exact = {}
     partial = []
+    
     try:
         with open(path, "r", encoding="utf-8-sig", newline="") as f:
             reader = csv.DictReader(f)
+            # 必須カラムチェック
             if "code" not in reader.fieldnames or "name" not in reader.fieldnames:
                 print(f"[Warning] CSV headers missing code or name: {reader.fieldnames}")
                 return {}, []
@@ -198,6 +235,8 @@ def load_master_csv(path: str) -> Tuple[Dict[str, str], List[Tuple[str, str, str
             for r in reader:
                 code = (r.get("code") or "").strip()
                 name = (r.get("name") or "").strip()
+                # sector は無視
+
                 code4 = re.sub(r"\D", "", code)[:4]
                 if len(code4) != 4 or not name:
                     continue
@@ -206,38 +245,19 @@ def load_master_csv(path: str) -> Tuple[Dict[str, str], List[Tuple[str, str, str
                 if n:
                     exact[n] = code4
                     partial.append((code4, name, n))
+                    
     except FileNotFoundError:
         print(f"[Error] {path} not found.")
         sys.exit(1)
+        
     return exact, partial
 
-def resolve_code(raw_name: str, exact: Dict[str, str], partial: List[Tuple[str, str, str]]) -> Tuple[Optional[str], str]:
-    """
-    raw_name が '銘柄名 業種' のようにスペース区切りで業種を含んでいる場合を考慮して解決する
-    """
-    # 1. そのままトライ
-    res = _resolve_single_name(raw_name, exact, partial)
-    if res[0]: 
-        return res
-
-    # 2. スペースで分割して、先頭部分（銘柄名と思われるもの）でトライ
-    # 例: "トヨタ自動車 輸送用機器" -> "トヨタ自動車"
-    parts = raw_name.split()
-    if len(parts) > 1:
-        candidate_name = parts[0]
-        # ただし短すぎる場合(1文字など)は誤爆するので避ける
-        if len(candidate_name) > 1:
-            res_split = _resolve_single_name(candidate_name, exact, partial)
-            if res_split[0]:
-                return res_split
-
-    return res # NOT_FOUND or AMBIGUOUS
-
-def _resolve_single_name(name: str, exact: Dict[str, str], partial: List[Tuple[str, str, str]]) -> Tuple[Optional[str], str]:
+def resolve_code(name: str, exact: Dict[str, str], partial: List[Tuple[str, str, str]]) -> Tuple[Optional[str], str]:
     key = normalize_name(name)
     if key in exact:
         return exact[key], "EXACT"
 
+    # 部分一致
     hits = []
     for code, raw, norm in partial:
         if key and (key in norm or norm in key):
@@ -259,6 +279,7 @@ def _resolve_single_name(name: str, exact: Dict[str, str], partial: List[Tuple[s
 def main():
     print(f"=== Job Start: {dt.datetime.now()} ===")
     
+    # Master Load
     exact, partial = load_master_csv(MASTER_CSV_PATH)
     print(f"Master loaded: {len(exact)} exact keys.")
 
@@ -269,6 +290,7 @@ def main():
         print(f"\n--- Processing: {fid} ---")
         
         try:
+            # 1. Find PDF
             pdf_url = ""
             report_date = None
             
@@ -280,22 +302,22 @@ def main():
             print(f"  Target PDF: {pdf_url}")
             print(f"  Report Date: {report_date}")
 
+            # 2. Download
             pdf_resp = http_get(pdf_url)
-            
+            pdf_bytes = pdf_resp.content
+
+            # 3. Extract Names
             raw_names = extract_top10_holdings(
-                pdf_resp.content, 
+                pdf_bytes, 
                 fund["extract_trigger"], 
                 fund["skip_keywords"]
             )
             
             if not raw_names:
                 print("  [Warning] No holdings found.")
-                # デバッグ用：抽出テキストの冒頭を表示して原因を探りやすくする
-                with pdfplumber.open(BytesIO(pdf_resp.content)) as pdf:
-                    first_text = pdf.pages[0].extract_text() or ""
-                    print(f"  [Debug First 200 chars]: {first_text[:200].replace(chr(10), ' ')}")
                 continue
 
+            # 4. Resolve Codes
             print("  [Holdings]")
             for name in raw_names:
                 code, status = resolve_code(name, exact, partial)
