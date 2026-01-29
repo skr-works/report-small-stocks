@@ -14,12 +14,18 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: monthly-report-main
+  cancel-in-progress: false
+
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -40,7 +46,13 @@ jobs:
 
       - name: Commit and Push state.json
         run: |
-          # untracked の state.json も拾うために先に add する
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+
+          # まずリモート最新に追随してから state をコミット対象へ
+          git fetch origin main
+          git rebase origin/main
+
           git add state.json || true
 
           # staged 差分がなければ終了
@@ -49,7 +61,17 @@ jobs:
             exit 0
           fi
 
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
           git commit -m "Update state.json"
-          git push
+
+          # push競合が起きても追随して最大3回リトライ
+          for i in 1 2 3; do
+            if git push; then
+              exit 0
+            fi
+            echo "Push rejected, retrying... ($i/3)"
+            git fetch origin main
+            git rebase origin/main
+          done
+
+          echo "Push failed after retries"
+          exit 1
