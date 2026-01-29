@@ -34,6 +34,16 @@ TARGET_FUNDS = [
         "skip_keywords": ["銘柄総数", "コード", "銘柄名", "業種", "比率"], # ヘッダや総数行をスキップ
         "extractor_type": "sparx_table",
     },
+    {
+        # 追加: ひふみマイクロスコープpro
+        "id": "Hifumi_MicroscopePro",
+        "url": "https://hifumi.rheos.jp/fund/microscope/",
+        "finder_type": "sparx_backtrack",  # 既存の後方探索ロジックを流用（-1 / -2 を含む）
+        "pdf_url_template": "https://hifumi.rheos.jp/fund/microscope/pdf/report{ym}.pdf",
+        "extract_trigger": "銘柄紹介（基準日時点の組入比率1~10位）",
+        "skip_keywords": [],
+        "extractor_type": "hifumi_rank_code",  # PDFから銘柄名＋コードを直接抜く
+    },
 ]
 
 # --- HTTP Helpers ---
@@ -240,6 +250,69 @@ def extract_top10_holdings_sparx_table(pdf_bytes: bytes, trigger: str) -> List[s
 
     return holdings[:10]
 
+def extract_top10_holdings_hifumi_rank_code(pdf_bytes: bytes, trigger: str) -> List[Tuple[str, str]]:
+    """
+    ひふみマイクロスコープpro:
+    「銘柄紹介（基準日時点の組入比率1~10位）」ページから
+    順位1〜10の「銘柄名」と「銘柄コード」を直接抽出する。
+    """
+    items: List[Tuple[str, str]] = []
+
+    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            t = page.extract_text() or ""
+            if not t or trigger not in t:
+                continue
+
+            lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+            in_block = False
+            pending_rank: Optional[int] = None
+
+            # コードは 4桁 or 212A のような英字混在(3桁+英大文字)を想定
+            code_pat = re.compile(r"^(.+?)\s+([0-9]{4}|[0-9]{3}[A-Z])\b")
+
+            for ln in lines:
+                if trigger in ln:
+                    in_block = True
+                    continue
+                if not in_block:
+                    continue
+
+                ln_hw = _fw_to_hw_digits(ln)
+
+                # rank 行（1〜10）が単独で出る
+                if re.fullmatch(r"\d{1,2}", ln_hw):
+                    r = int(ln_hw)
+                    if 1 <= r <= 10:
+                        pending_rank = r
+                    else:
+                        pending_rank = None
+                    continue
+
+                if pending_rank is None:
+                    continue
+
+                m = code_pat.match(ln_hw)
+                if not m:
+                    continue
+
+                name = m.group(1).strip()
+                code = m.group(2).strip()
+
+                # 期待レンジのみ採用（重複も抑制）
+                if 1 <= pending_rank <= 10 and name and code:
+                    if name not in [x[0] for x in items]:
+                        items.append((name, code))
+
+                pending_rank = None  # 次の順位待ち
+
+                if len(items) >= 10:
+                    break
+
+            break  # trigger があるページだけ見れば十分
+
+    return items[:10]
+
 # --- Master Data & Resolver ---
 
 def normalize_name(s: str) -> str:
@@ -352,10 +425,15 @@ def main():
             pdf_resp = http_get(pdf_url)
             pdf_bytes = pdf_resp.content
 
-            # 3. Extract Names
-            raw_names = []
+            # 3. Extract
+            raw_names: List[str] = []
+            raw_items: List[Tuple[str, str]] = []
+
             if fund.get("extractor_type") == "sparx_table":
                 raw_names = extract_top10_holdings_sparx_table(pdf_bytes, fund["extract_trigger"])
+            elif fund.get("extractor_type") == "hifumi_rank_code":
+                raw_items = extract_top10_holdings_hifumi_rank_code(pdf_bytes, fund["extract_trigger"])
+                raw_names = [n for n, _ in raw_items]
             else:
                 raw_names = extract_top10_holdings(
                     pdf_bytes,
@@ -367,19 +445,30 @@ def main():
                 print("  [Warning] No holdings found.")
                 continue
 
-            # 4. Resolve Codes
+            # 4. Resolve Codes / or use PDF codes
             print("  [Holdings]")
-            for name in raw_names:
-                code, status = resolve_code(name, exact, partial)
-                print(f"    - {name} -> {code} ({status})")
+            if fund.get("extractor_type") == "hifumi_rank_code":
+                for name, code_raw in raw_items:
+                    print(f"    - {name} -> {code_raw} (PDF)")
+                    results.append({
+                        "fund_id": fid,
+                        "report_date": str(report_date),
+                        "rank_name": name,
+                        "code": code_raw,
+                        "status": "PDF"
+                    })
+            else:
+                for name in raw_names:
+                    code, status = resolve_code(name, exact, partial)
+                    print(f"    - {name} -> {code} ({status})")
 
-                results.append({
-                    "fund_id": fid,
-                    "report_date": str(report_date),
-                    "rank_name": name,
-                    "code": code,
-                    "status": status
-                })
+                    results.append({
+                        "fund_id": fid,
+                        "report_date": str(report_date),
+                        "rank_name": name,
+                        "code": code,
+                        "status": status
+                    })
 
         except Exception as e:
             print(f"  [Error] Failed to process {fid}: {e}")
