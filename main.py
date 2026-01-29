@@ -34,6 +34,13 @@ TARGET_FUNDS = [
         "skip_keywords": ["銘柄総数", "コード", "銘柄名", "業種", "比率"], # ヘッダや総数行をスキップ
         "extractor_type": "sparx_table",
     },
+    {
+        # 追加: ひふみマイクロスコープpro（HTMLに銘柄名/銘柄コードがある前提）
+        "id": "Hifumi_MicroscopePro",
+        "url": "https://hifumi.rheos.jp/fund/microscope/latest_report/",
+        "finder_type": "hifumi_html",
+        "extractor_type": "hifumi_html",
+    },
 ]
 
 # --- HTTP Helpers ---
@@ -117,6 +124,34 @@ def find_pdf_sparx_backtrack(url_template: str) -> Tuple[str, Optional[dt.date]]
         print("404")
 
     raise RuntimeError("Latest PDF not found (checked last 3 months).")
+
+def _find_latest_jp_date_in_text(text: str) -> Optional[dt.date]:
+    """
+    HTML全体から YYYY年M月D日 / YYYY年M月末 を拾って、最大日付を返す。
+    ひふみ側が日付を明示していない場合は None のまま。
+    """
+    if not text:
+        return None
+
+    dates: List[dt.date] = []
+
+    # YYYY年M月D日
+    for m in re.finditer(r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日", text):
+        try:
+            y, mo, d = map(int, m.groups())
+            dates.append(dt.date(y, mo, d))
+        except Exception:
+            pass
+
+    # YYYY年M月末
+    for m in re.finditer(r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*末", text):
+        try:
+            y, mo = map(int, m.groups())
+            dates.append(dt.date(y, mo, 1) + relativedelta(months=1, days=-1))
+        except Exception:
+            pass
+
+    return max(dates) if dates else None
 
 # --- Extractor ---
 
@@ -240,6 +275,191 @@ def extract_top10_holdings_sparx_table(pdf_bytes: bytes, trigger: str) -> List[s
 
     return holdings[:10]
 
+def extract_top10_holdings_hifumi_html(html: str) -> List[Dict[str, Any]]:
+    """
+    ひふみのマンスリーレポートHTMLから、上位10銘柄の「銘柄名」「銘柄コード」を抽出する。
+    形式が変わる可能性があるため、以下の順で保守的に探索する：
+      1) table(th: 銘柄名/銘柄コード) をパース
+      2) dl(dt/dd: 銘柄名/銘柄コード) をパース（カード形式想定）
+      3) script内のJSONっぽい塊から name/code 近傍を正規表現抽出
+    戻り値: [{"rank": 1, "name": "...", "code": "1234"}, ...]
+    """
+    soup = BeautifulSoup(html, "lxml")
+    items: List[Dict[str, Any]] = []
+
+    def _norm_code(s: str) -> Optional[str]:
+        s = (s or "").strip()
+        s = _fw_to_hw_digits(s)
+        m = re.search(r"(\d{4})", s)
+        return m.group(1) if m else None
+
+    def _add(rank: Optional[int], name: str, code: str):
+        if not name or not code:
+            return
+        # 重複排除（code優先）
+        for it in items:
+            if it.get("code") == code:
+                return
+        items.append({"rank": rank, "name": name.strip(), "code": code})
+
+    # (1) table探索
+    for table in soup.find_all("table"):
+        # headers を th/td で拾う（実装差異対策）
+        header_cells = table.find_all(["th"])
+        headers = [hc.get_text(" ", strip=True) for hc in header_cells]
+        if not headers:
+            # thが無い場合、最初のtrをヘッダ扱いしてみる
+            first_tr = table.find("tr")
+            if first_tr:
+                headers = [c.get_text(" ", strip=True) for c in first_tr.find_all(["td", "th"])]
+
+        if not headers:
+            continue
+
+        # 必須: 銘柄名 と 銘柄コード（または「コード」）を含む
+        if not any("銘柄名" in h for h in headers):
+            continue
+        if not any(("銘柄" in h and "コード" in h) or (h.strip() == "コード") for h in headers):
+            continue
+
+        # index決定
+        name_idx = None
+        code_idx = None
+        rank_idx = None
+
+        for i, h in enumerate(headers):
+            hh = (h or "").strip()
+            if name_idx is None and "銘柄名" in hh:
+                name_idx = i
+            if code_idx is None and (("銘柄" in hh and "コード" in hh) or (hh == "コード")):
+                code_idx = i
+            if rank_idx is None and ("順位" in hh or hh in ["#", "No", "NO", "順"]):
+                rank_idx = i
+
+        # rank列が無い場合は先頭セルが順位のケースを拾う
+        for tr in table.find_all("tr"):
+            cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
+            if not cells:
+                continue
+            if name_idx is None or code_idx is None:
+                continue
+            if len(cells) <= max(name_idx, code_idx):
+                continue
+
+            raw_name = (cells[name_idx] or "").strip()
+            raw_code = (cells[code_idx] or "").strip()
+            code4 = _norm_code(raw_code)
+            if not code4:
+                continue
+
+            # header行の混入避け
+            if "銘柄名" in raw_name and ("銘柄" in raw_code and "コード" in raw_code):
+                continue
+
+            # rank推定
+            rank = None
+            if rank_idx is not None and len(cells) > rank_idx:
+                rr = _fw_to_hw_digits((cells[rank_idx] or "").strip())
+                m = re.match(r"^\s*(\d{1,2})\s*$", rr)
+                if m:
+                    rank = int(m.group(1))
+            else:
+                rr0 = _fw_to_hw_digits((cells[0] or "").strip())
+                m = re.match(r"^\s*(\d{1,2})\s*$", rr0)
+                if m:
+                    rank = int(m.group(1))
+
+            _add(rank, raw_name, code4)
+            if len(items) >= 10:
+                break
+
+        if len(items) >= 10:
+            break
+
+    # (2) dl(dt/dd)探索（カード形式想定）
+    if len(items) < 10:
+        for dl in soup.find_all("dl"):
+            dts = dl.find_all("dt")
+            dds = dl.find_all("dd")
+            if not dts or not dds or len(dts) != len(dds):
+                continue
+
+            mp: Dict[str, str] = {}
+            for dt_tag, dd_tag in zip(dts, dds):
+                k = dt_tag.get_text(" ", strip=True)
+                v = dd_tag.get_text(" ", strip=True)
+                if k and v:
+                    mp[k] = v
+
+            # key揺れ対策
+            name_val = None
+            code_val = None
+            for k, v in mp.items():
+                if name_val is None and "銘柄名" in k:
+                    name_val = v
+                if code_val is None and (("銘柄" in k and "コード" in k) or k.strip() == "コード"):
+                    code_val = v
+
+            code4 = _norm_code(code_val or "")
+            if not name_val or not code4:
+                continue
+
+            # rankはdlの近傍から拾う（親の先頭に "1" などがある想定）
+            rank = None
+            parent_text = dl.parent.get_text("\n", strip=True) if dl.parent else dl.get_text("\n", strip=True)
+            # 先頭付近の単独数字を優先
+            for ln in (parent_text or "").splitlines()[:5]:
+                ln2 = _fw_to_hw_digits(ln.strip())
+                m = re.match(r"^\s*(\d{1,2})\s*$", ln2)
+                if m:
+                    rank = int(m.group(1))
+                    break
+
+            _add(rank, name_val, code4)
+            if len(items) >= 10:
+                break
+
+    # (3) script内のJSON近傍を正規表現で拾う（最終手段）
+    if len(items) < 10:
+        scripts_text = "\n".join([(s.get_text() or "") for s in soup.find_all("script")])
+
+        # name->code の順
+        pat1 = re.compile(
+            r'(?:"銘柄名"|"name"|"stock_name"|"securityName")\s*:\s*"([^"]+?)".{0,200}?'
+            r'(?:"銘柄コード"|"code"|"stock_code"|"ticker"|"securityCode")\s*:\s*"?(\d{4})"?',
+            re.DOTALL,
+        )
+        # code->name の順
+        pat2 = re.compile(
+            r'(?:"銘柄コード"|"code"|"stock_code"|"ticker"|"securityCode")\s*:\s*"?(\d{4})"?.{0,200}?'
+            r'(?:"銘柄名"|"name"|"stock_name"|"securityName")\s*:\s*"([^"]+?)"',
+            re.DOTALL,
+        )
+
+        for m in pat1.finditer(scripts_text):
+            name = m.group(1).strip()
+            code = m.group(2).strip()
+            _add(None, name, code)
+            if len(items) >= 10:
+                break
+
+        if len(items) < 10:
+            for m in pat2.finditer(scripts_text):
+                code = m.group(1).strip()
+                name = m.group(2).strip()
+                _add(None, name, code)
+                if len(items) >= 10:
+                    break
+
+    # rankが全てNoneのときは 1.. の連番を振る（出力体裁用）
+    if items and all(it.get("rank") is None for it in items):
+        for i, it in enumerate(items[:10], start=1):
+            it["rank"] = i
+
+    # rank順にソート（Noneは後ろ）
+    items.sort(key=lambda x: (x.get("rank") is None, x.get("rank") or 9999))
+    return items[:10]
+
 # --- Master Data & Resolver ---
 
 def normalize_name(s: str) -> str:
@@ -336,6 +556,34 @@ def main():
         print(f"\n--- Processing: {fid} ---")
 
         try:
+            # ひふみ：HTMLから直接 銘柄名/銘柄コード を取る
+            if fund.get("finder_type") == "hifumi_html":
+                resp = http_get(fund["url"])
+                report_date = _find_latest_jp_date_in_text(resp.text)
+                print(f"  Target Page: {fund['url']}")
+                print(f"  Report Date: {report_date}")
+
+                holdings = extract_top10_holdings_hifumi_html(resp.text)
+                if not holdings:
+                    print("  [Warning] No holdings found (hifumi_html).")
+                    continue
+
+                print("  [Holdings]")
+                for it in holdings:
+                    name = it.get("name")
+                    code = it.get("code")
+                    rank = it.get("rank")
+                    print(f"    - {rank}. {name} -> {code} (FROM_HTML)")
+
+                    results.append({
+                        "fund_id": fid,
+                        "report_date": str(report_date),
+                        "rank_name": name,
+                        "code": code,
+                        "status": "FROM_HTML"
+                    })
+                continue
+
             # 1. Find PDF
             pdf_url = ""
             report_date = None
