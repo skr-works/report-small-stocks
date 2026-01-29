@@ -2,6 +2,8 @@ import re
 import sys
 import csv
 import datetime as dt
+import os
+import json
 from io import BytesIO
 from typing import List, Optional, Tuple, Dict, Any
 from dateutil.relativedelta import relativedelta  # 日付計算用
@@ -13,6 +15,8 @@ from bs4 import BeautifulSoup
 # --- Configuration ---
 UA = "MonthlyFundReportBot/0.5 (github-actions test)"
 MASTER_CSV_PATH = "data/master.csv"
+STATE_JSON_PATH = "state.json"
+CHATWORK_CONFIG_ENV = "CHATWORK_CONFIG"
 
 # ファンド設定リスト
 TARGET_FUNDS = [
@@ -393,6 +397,65 @@ def resolve_code(name: str, exact: Dict[str, str], partial: List[Tuple[str, str,
 
     return None, "NOT_FOUND"
 
+# --- Chatwork / State (added) ---
+
+def load_state(path: str) -> Dict[str, str]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+            if isinstance(obj, dict):
+                return {str(k): str(v) for k, v in obj.items()}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print(f"[Warning] Failed to read {path}: {e}")
+    return {}
+
+def save_state(path: str, state: Dict[str, str]) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2, sort_keys=True)
+
+def get_ym(report_date: Optional[dt.date], pdf_url: str) -> Optional[str]:
+    if report_date:
+        return report_date.strftime("%Y%m")
+    m = re.search(r"(\d{6})", pdf_url)
+    if m:
+        return m.group(1)
+    return None
+
+def get_chatwork_config() -> Tuple[Optional[str], Optional[str]]:
+    raw = os.getenv(CHATWORK_CONFIG_ENV, "").strip()
+    if not raw:
+        return None, None
+    try:
+        obj = json.loads(raw)
+        token = (obj.get("api_token") or "").strip()
+        room_id = str(obj.get("room_id") or "").strip()
+        if not token or not room_id:
+            return None, None
+        return token, room_id
+    except Exception:
+        return None, None
+
+def chatwork_send(token: str, room_id: str, body: str) -> bool:
+    url = f"https://api.chatwork.com/v2/rooms/{room_id}/messages"
+    headers = {"X-ChatWorkToken": token}
+    data = {"body": body}
+    try:
+        r = requests.post(url, headers=headers, data=data, timeout=20)
+        if r.status_code == 200:
+            return True
+        print(f"[Error] Chatwork send failed: status={r.status_code} body={r.text[:200]}")
+        return False
+    except Exception as e:
+        print(f"[Error] Chatwork send exception: {e}")
+        return False
+
+def build_message(fund_id: str, ym: str, codes: List[str]) -> str:
+    lines = [f"【月次レポート更新】{fund_id} {ym}"]
+    lines.extend(codes)
+    return "\n".join(lines)
+
 # --- Main ---
 
 def main():
@@ -401,6 +464,12 @@ def main():
     # Master Load
     exact, partial = load_master_csv(MASTER_CSV_PATH)
     print(f"Master loaded: {len(exact)} exact keys.")
+
+    state = load_state(STATE_JSON_PATH)
+    token, room_id = get_chatwork_config()
+    if not token or not room_id:
+        print(f"[Warning] Chatwork config missing. Set secrets.{CHATWORK_CONFIG_ENV}.")
+    state_updated = False
 
     results = []
 
@@ -418,8 +487,11 @@ def main():
             elif fund["finder_type"] == "sparx_backtrack":
                 pdf_url, report_date = find_pdf_sparx_backtrack(fund["pdf_url_template"])
 
+            ym = get_ym(report_date, pdf_url)
+
             print(f"  Target PDF: {pdf_url}")
             print(f"  Report Date: {report_date}")
+            print(f"  YM: {ym}")
 
             # 2. Download
             pdf_resp = http_get(pdf_url)
@@ -447,6 +519,8 @@ def main():
 
             # 4. Resolve Codes / or use PDF codes
             print("  [Holdings]")
+            codes_for_message: List[str] = []
+
             if fund.get("extractor_type") == "hifumi_rank_code":
                 for name, code_raw in raw_items:
                     print(f"    - {name} -> {code_raw} (PDF)")
@@ -457,6 +531,8 @@ def main():
                         "code": code_raw,
                         "status": "PDF"
                     })
+                    if code_raw:
+                        codes_for_message.append(code_raw)
             else:
                 for name in raw_names:
                     code, status = resolve_code(name, exact, partial)
@@ -470,10 +546,46 @@ def main():
                         "status": status
                     })
 
+                    if code:
+                        codes_for_message.append(code)
+
+            # --- Notify if updated (added) ---
+            if not ym:
+                print("  [Notify] SKIP (YM not determined)")
+                continue
+
+            prev = state.get(fid)
+            if prev == ym:
+                print("  [Notify] NO (no update)")
+                continue
+
+            if not codes_for_message:
+                print("  [Notify] SKIP (no codes)")
+                continue
+
+            if not token or not room_id:
+                print("  [Notify] SKIP (chatwork config missing)")
+                continue
+
+            body = build_message(fid, ym, codes_for_message)
+            ok = chatwork_send(token, room_id, body)
+            if ok:
+                print("  [Notify] YES (sent)")
+                state[fid] = ym
+                state_updated = True
+            else:
+                print("  [Notify] FAIL (not sent)")
+
         except Exception as e:
             print(f"  [Error] Failed to process {fid}: {e}")
             import traceback
             traceback.print_exc()
+
+    if state_updated:
+        save_state(STATE_JSON_PATH, state)
+        print(f"\n[State] Updated: {STATE_JSON_PATH}")
+    else:
+        print("\n[State] No update")
 
     print("\n=== Job Finished ===")
     # ここで results をファイルに出力するなどの処理が可能
