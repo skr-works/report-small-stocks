@@ -75,3 +75,29 @@ jobs:
 
           echo "Push failed after retries"
           exit 1
+
+      - name: Keepalive (empty commit if 50+ days since last commit)
+        run: |
+          set -euo pipefail
+
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+
+          # リモート最新へ追随（履歴判定＆pushの競合回避）
+          git fetch origin main
+          git rebase origin/main
+
+          # HEAD のコミット日時（epoch）
+          last_ts="$(git log -1 --format=%ct)"
+          now_ts="$(date +%s)"
+          days="$(( (now_ts - last_ts) / 86400 ))"
+
+          echo "Days since last commit: ${days}"
+
+          if [ "${days}" -lt 50 ]; then
+            echo "Keepalive not needed"
+            exit 0
+          fi
+
+          git commit --allow-empty -m "chore: keepalive"
+          git push
