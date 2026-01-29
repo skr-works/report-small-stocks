@@ -1,12 +1,17 @@
-name: Monthly Report Smoke Test (Small Monster)
+name: Monthly Report
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "20 0 * * 1-5"
   push:
     paths:
       - "main.py"
       - "requirements.txt"
       - ".github/workflows/test_monthly.yml"
+
+permissions:
+  contents: write
 
 jobs:
   run:
@@ -27,5 +32,19 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run
+        env:
+          CHATWORK_CONFIG: ${{ secrets.CHATWORK_CONFIG }}
         run: |
           python main.py
+
+      - name: Commit and Push state.json
+        run: |
+          if git diff --quiet -- state.json; then
+            echo "No state.json changes"
+            exit 0
+          fi
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add state.json
+          git commit -m "Update state.json"
+          git push
