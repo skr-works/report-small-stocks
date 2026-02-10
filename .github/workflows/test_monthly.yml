@@ -1,4 +1,4 @@
-name: Monthly Report
+  name: report small stocks
 
 on:
   workflow_dispatch:
@@ -49,10 +49,8 @@ jobs:
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
 
-          # まずリモート最新に追随してから state をコミット対象へ
-          git fetch origin main
-          git rebase origin/main
-
+          # --- 修正箇所: ここから ---
+          # 先に add / commit して変更を確定させる (Unstagedな変更があるとrebaseできないため)
           git add state.json || true
 
           # staged 差分がなければ終了
@@ -62,6 +60,11 @@ jobs:
           fi
 
           git commit -m "Update state.json"
+
+          # コミット後にリモート最新を取り込む
+          git fetch origin main
+          git rebase origin/main
+          # --- 修正箇所: ここまで ---
 
           # push競合が起きても追随して最大3回リトライ
           for i in 1 2 3; do
