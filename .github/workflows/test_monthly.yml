@@ -1,4 +1,4 @@
-  name: report small stocks
+name: report small stocks
 
 on:
   workflow_dispatch:
