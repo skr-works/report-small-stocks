@@ -451,8 +451,9 @@ def chatwork_send(token: str, room_id: str, body: str) -> bool:
         print(f"[Error] Chatwork send exception: {e}")
         return False
 
-def build_message(fund_id: str, ym: str, codes: List[str]) -> str:
+def build_message(fund_id: str, ym: str, source_url: str, codes: List[str]) -> str:
     lines = [f"【月次レポート更新】{fund_id} {ym}"]
+    lines.append(source_url)  # URLを追加
     lines.extend(codes)
     return "\n".join(lines)
 
@@ -567,7 +568,8 @@ def main():
                 print("  [Notify] SKIP (chatwork config missing)")
                 continue
 
-            body = build_message(fid, ym, codes_for_message)
+            # ここを修正: fund["url"] を渡す
+            body = build_message(fid, ym, fund["url"], codes_for_message)
             ok = chatwork_send(token, room_id, body)
             if ok:
                 print("  [Notify] YES (sent)")
